@@ -1,0 +1,7 @@
+name: sales_closer_env
+version: "1.0.0"
+description: "A B2B sales call simulation environment where AI agents practice discovery, objection handling, and closing against realistic AI-powered prospect personas."
+author: "<your-hf-username>"
+docker:
+  image: sales_closer_env:latest
+  port: 8000
