@@ -1,3 +1,13 @@
+---
+title: SalesCloserEnv
+emoji: 💼
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # SalesCloserEnv
 
 An OpenEnv environment that simulates realistic B2B sales conversations for training AI sales agents.
