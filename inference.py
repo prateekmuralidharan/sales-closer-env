@@ -27,10 +27,10 @@ from openai import OpenAI
 
 ENV_URL = os.environ.get("ENV_URL", "http://localhost:8000").rstrip("/")
 client = OpenAI(
-    base_url=os.environ["API_BASE_URL"],
+    base_url=os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1"),
     api_key=os.environ.get("HF_TOKEN", "x"),
 )
-MODEL = os.environ["MODEL_NAME"]
+MODEL = os.environ.get("MODEL_NAME", "llama-3.1-8b-instant")
 
 TASKS = ["warm_lead", "skeptic", "hostile_exec", "tire_kicker"]
 
