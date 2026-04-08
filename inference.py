@@ -1,38 +1,67 @@
-import subprocess
-import sys
-
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests", "openai"])
-
 """
 inference.py — Baseline Sales Agent for SalesCloserEnv
 
-This script:
-  1. Connects to the environment server
-  2. Runs all 4 tasks sequentially
-  3. For each task: resets, then loops step() until done
-  4. Uses OpenAI client (via env vars) for all LLM calls
-  5. Prints scores for each task and overall average
-
-Runtime budget: ~5 min per task x 4 tasks = 20 min max
+STDOUT FORMAT (required):
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 
 Required env vars:
   API_BASE_URL  — LLM API endpoint
   MODEL_NAME    — model identifier
+  HF_TOKEN      — Hugging Face / API key
   ENV_URL       — environment server URL (default: http://localhost:8000)
 """
-import os
-import time
-import requests
-from openai import OpenAI
 
-ENV_URL = os.environ.get("ENV_URL", "http://localhost:8000").rstrip("/")
-client = OpenAI(
-    base_url=os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1"),
-    api_key=os.environ.get("HF_TOKEN", "x"),
-)
-MODEL = os.environ.get("MODEL_NAME", "llama-3.1-8b-instant")
+import os
+import sys
+import time
+from typing import List, Optional
+
+try:
+    import requests
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
+    import requests
+
+try:
+    from openai import OpenAI
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openai"])
+    from openai import OpenAI
+
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://api.groq.com/openai/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "llama-3.1-8b-instant"
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+ENV_URL = os.getenv("ENV_URL", "http://localhost:8000").rstrip("/")
+BENCHMARK = "sales-closer-env"
+
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 TASKS = ["warm_lead", "skeptic", "hostile_exec", "tire_kicker"]
+
+
+# ── Structured logging ────────────────────────────────────────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    action_safe = action.replace("\n", " ")[:80]
+    print(f"[STEP] step={step} action={action_safe} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+
+# ── Agent logic ───────────────────────────────────────────────────────────────
 
 AGENT_SYSTEM_PROMPT = """You are an expert B2B sales development representative (SDR). You are on a live sales call with a prospect.
 
@@ -95,7 +124,6 @@ def decide_action_type(
     max_turns: int,
     conversation: list = None,
 ) -> str:
-    """Determine the action_type based on message content and turn context."""
     msg_lower = agent_message.lower()
 
     disqualify_signals = [
@@ -110,7 +138,6 @@ def decide_action_type(
     if turn_number >= 6 and any(signal in msg_lower for signal in disqualify_signals):
         return "disqualify"
 
-    # Detect unqualified prospects from conversation history
     if turn_number >= 8 and conversation:
         prospect_text = " ".join(
             m["message"].lower() for m in conversation if m["role"] == "prospect"
@@ -179,101 +206,101 @@ CONVERSATION SO FAR:
     return prompt
 
 
-def run_agent(task_id: str) -> float:
-    """Run the agent on a single task and return the final score."""
-    # Reset the environment
-    reset_resp = requests.post(
-        f"{ENV_URL}/reset",
-        json={"task_id": task_id},
-        timeout=30,
-    )
-    reset_resp.raise_for_status()
-    data = reset_resp.json()
-    observation = data["observation"]
+def run_task(task_id: str) -> None:
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
-    conversation: list = []
-    done = False
-    final_score = 0.0
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    while not done:
-        user_prompt = build_user_prompt(observation, conversation)
-
-        for attempt in range(5):
-            try:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=[
-                        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=200,
-                    temperature=0.7,
-                )
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt < 4:
-                    wait = 10 * (attempt + 1)
-                    print(f"  [Rate limit] Waiting {wait}s...")
-                    time.sleep(wait)
-                else:
-                    raise
-        agent_message = response.choices[0].message.content.strip()
-
-        action_type = decide_action_type(
-            agent_message,
-            observation.get("turn_number", 0),
-            observation.get("max_turns", 18),
-            conversation,
+    try:
+        reset_resp = requests.post(
+            f"{ENV_URL}/reset",
+            json={"task_id": task_id},
+            timeout=30,
         )
+        reset_resp.raise_for_status()
+        data = reset_resp.json()
+        observation = data["observation"]
 
-        print(f"  [Turn {observation.get('turn_number', '?')}] Agent ({action_type}): {agent_message[:80]}...")
+        conversation: list = []
+        done = False
 
-        step_resp = requests.post(
-            f"{ENV_URL}/step",
-            json={"action": {"message": agent_message, "action_type": action_type}},
-            timeout=60,
-        )
-        step_resp.raise_for_status()
-        step_data = step_resp.json()
+        while not done:
+            user_prompt = build_user_prompt(observation, conversation)
 
-        observation = step_data["observation"]
-        reward = step_data["reward"]
-        done = step_data["done"]
+            agent_message = ""
+            step_error = None
+            for attempt in range(5):
+                try:
+                    response = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=[
+                            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        max_tokens=200,
+                        temperature=0.7,
+                    )
+                    agent_message = response.choices[0].message.content.strip()
+                    break
+                except Exception as e:
+                    if "429" in str(e) and attempt < 4:
+                        time.sleep(10 * (attempt + 1))
+                    else:
+                        step_error = str(e)
+                        agent_message = "I appreciate your time. Let me follow up with more details."
+                        break
 
-        conversation.append({"role": "agent", "message": agent_message})
-        if not done and observation.get("prospect_message"):
-            prospect_msg = observation["prospect_message"]
-            conversation.append({"role": "prospect", "message": prospect_msg})
-            print(f"  [Turn {observation.get('turn_number', '?')}] Prospect: {prospect_msg[:80]}...")
+            action_type = decide_action_type(
+                agent_message,
+                observation.get("turn_number", 0),
+                observation.get("max_turns", 18),
+                conversation,
+            )
 
-        time.sleep(2)
+            step_resp = requests.post(
+                f"{ENV_URL}/step",
+                json={"action": {"message": agent_message, "action_type": action_type}},
+                timeout=60,
+            )
+            step_resp.raise_for_status()
+            step_data = step_resp.json()
 
-        if done:
-            final_score = reward
-            breakdown = observation.get("score_breakdown", {})
-            if breakdown:
-                print(f"  Score breakdown: {breakdown.get('breakdown', {})}")
+            observation = step_data["observation"]
+            reward = step_data["reward"]
+            done = step_data["done"]
+            steps_taken += 1
 
-    return final_score
+            rewards.append(reward)
+            log_step(
+                step=steps_taken,
+                action=f"{action_type}:{agent_message[:60]}",
+                reward=reward,
+                done=done,
+                error=step_error,
+            )
+
+            conversation.append({"role": "agent", "message": agent_message})
+            if not done and observation.get("prospect_message"):
+                conversation.append({"role": "prospect", "message": observation["prospect_message"]})
+
+            if done:
+                score = reward
+                success = score >= 0.5
+
+            time.sleep(2)
+
+    except Exception as e:
+        score = 0.0
+        success = False
+        print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":
-    scores = {}
     for task_id in TASKS:
-        print(f"\n{'='*60}")
-        print(f"Running task: {task_id}")
-        print(f"{'='*60}")
-        try:
-            score = run_agent(task_id)
-        except Exception as e:
-            print(f"  ERROR on task {task_id}: {e}")
-            score = 0.0
-        scores[task_id] = score
-        print(f"Task {task_id} score: {score:.4f}")
-
-    avg_score = sum(scores.values()) / len(scores)
-    print(f"\n{'='*60}")
-    print(f"OVERALL AVERAGE SCORE: {avg_score:.4f}")
-    print(f"{'='*60}")
-    for task_id, score in scores.items():
-        print(f"  {task_id}: {score:.4f}")
+        run_task(task_id)
